@@ -14,6 +14,7 @@ import configparser
 import threading
 from influxdb import InfluxDBClient
 from time import gmtime, strftime
+import os
 
 def set_logger():
     _LOGGER = logging.getLogger(__name__)
@@ -55,7 +56,7 @@ class DATA_LOGGER:
             #self.client.loop_start()
 
         except Exception as ex:
-            _LOGGER.error("connect mqtt error: " + ex)
+            _LOGGER.error(f"connect mqtt error: {ex}")
             return None
         #return client
     def connect_influx():
@@ -72,15 +73,16 @@ class DATA_LOGGER:
         if self.send_data:
           _LOGGER.info("Trying mqtt publish topic: {}  ".format(self.topic))
           battery_data['name'] = table_name
+          #print(battery_data)
 
           json_battery_data = json.dumps(battery_data, indent=4)
-          #_LOGGER.debug(json_battery_data)
+          _LOGGER.debug(json_battery_data)
 
           try:
               self.client.publish(self.topic + "/" + "battery_data", json_battery_data)
               for key in battery_data:
-                  #print(key + "/" + key  str(battery_data[key]))
-                  self.client.publish(self.topic + "/" + key, str(battery_data[key]))
+                  mqtt_response = self.client.publish(self.topic + "/" + key, str(battery_data[key]))
+                  _LOGGER.debug(f"{self.topic}/key /{battery_data[key]} - response: {mqtt_response}")
           except Exception as ex:
               _LOGGER.error("mqtt publish error: " + str(ex))
               #exit(0)
@@ -102,7 +104,7 @@ class DATA_LOGGER:
                   else:
                       battery_data[key] = float(battery_data[key])
               for key in range(8):
-                  key = "cell_amps_" + str(key + 1)
+                  key = "cell_" + str(key + 1)
                   if battery_data[key] is None:
                       battery_data[key] = float(0)
                   else:
@@ -132,8 +134,11 @@ class DATA_LOGGER:
 class ANT_BMS:
     def __init__(self):
         def read_config():
+            thisfolder = os.path.dirname(os.path.abspath(__file__))
+            bms_conf = os.path.join(thisfolder, 'ant_bms.conf')
+            # print thisfolder
             config = configparser.ConfigParser()
-            config.read("ant_bms.conf")
+            config.read(bms_conf)
             return config
 
 
@@ -142,7 +147,9 @@ class ANT_BMS:
         self.connect_retry_delay = config.getint("BLUETOOTH","connect_retry_delay")
         self.need_discover = config.getboolean("BLUETOOTH","need_discover")
 
-        with open('batteries.json', 'r') as batteries_file:
+        thisfolder = os.path.dirname(os.path.abspath(__file__))
+        batteries_conf = os.path.join(thisfolder,'batteries.json')
+        with open(batteries_conf, 'r') as batteries_file:
             batteries_data = json.load(batteries_file)
 
         self.batteries = batteries_data
@@ -191,12 +198,10 @@ class ANT_BMS:
                         try:
                             _LOGGER.debug("decode_data: " + str(response_data))
                             # remain ah
-                            battery['remain_ah'] = int(response_data[79 * 2:82 * 2 + 2], 16) / 1000000
-
+                            battery['remain_ah'] = round(int(response_data[79 * 2:82 * 2 + 2], 16) / 1000000, 1)
                             battery['discharge_status'] = int(response_data[104 * 2:104 * 2 + 2])
                             battery['charge_status'] = int(response_data[103 * 2:103 * 2 + 2])
                             battery['balance_status'] = int(response_data[105 * 2:105 * 2 + 2])
-
                             try:
                                 balance_data = response_data[134 * 2:135 * 2 + 2]
                             except:
@@ -230,7 +235,7 @@ class ANT_BMS:
                             # BMS V (4)
                             data = response_data[8:12]
                             data = struct.unpack('>H', unhexlify(data))[0] * 0.1
-                            battery['bms_v'] = float(data + 0.7)
+                            battery['bms_v'] = round(float(data + 0.7), 1)
                             # 0.7 was added as BMS low.
 
                             # Cell_avg (5)
@@ -240,14 +245,21 @@ class ANT_BMS:
                             # Cell_min (6)
                             data = (response_data[(119 * 2):(120 * 2 + 2)])
                             battery['cell_min'] = float(struct.unpack('>H', unhexlify(data))[0] / 1000)
+                            data = (response_data[118 * 2:118 * 2 + 2])
+                            battery['cell_min_id'] = struct.unpack('>B', unhexlify(data))[0]
 
                             # Cell_max (7)
                             data = (response_data[(116 * 2):(117 * 2 + 2)])
                             battery['cell_max'] = float(struct.unpack('>H', unhexlify(data))[0] / 1000)
+                            data = (response_data[115 * 2:115 * 2 + 2])
+                            battery['cell_max_id'] = struct.unpack('>B', unhexlify(data))[0]
+
+                            # Cell_diff
+                            battery['cell_diff'] = int(round(battery['cell_max'] - battery['cell_min'], 3) * 1000)
 
                             for i in range(cell_count):
                                 data = response_data[((6 + i * 2) * 2):((7 + i * 2) * 2 + 2)]
-                                battery['cell_amps_' + str(i + 1)] = float(struct.unpack('>H', unhexlify(data))[0] / 1000)
+                                battery['cell_' + str(i + 1)] = float(struct.unpack('>H', unhexlify(data))[0] / 1000)
 
                             data_power_temp = (response_data[92 * 2:92 * 2 + 2])
                             battery['mosfet_temp'] = int(data_power_temp, 16)
@@ -286,7 +298,7 @@ class ANT_BMS:
                         try:
                             s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
                         except Exception as ex:
-                            _LOGGER.error("Socket error: " + ex)
+                            _LOGGER.error("Socket error: " + str(ex))
                             return None
 
                         try:
@@ -395,8 +407,8 @@ class ANT_BMS:
                 _LOGGER.info("Starting reading thread idx:" +str(idx)+ " for battery: " + json.dumps(battery, indent=4))
                 while True:
                     read_battery_data(self,battery)
-                    _LOGGER.debug("Sleeping 30 sec")
-                    time.sleep(30)
+                    _LOGGER.debug("Sleeping 60 sec")
+                    time.sleep(60)
             except (KeyboardInterrupt, SystemExit):
                 _LOGGER.debug("interrupted!")
                 exit(0)
